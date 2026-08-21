@@ -1,0 +1,3 @@
+tags:
+  physical:
+    skip: Physical hardware tests require an explicitly configured lab runner.

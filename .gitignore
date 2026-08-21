@@ -1,0 +1,11 @@
+.dart_tool/
+.packages
+build/
+coverage/
+doc/api/
+pubspec.lock
+*.iml
+.idea/
+.vscode/
+sdkconfig
+sdkconfig.old
