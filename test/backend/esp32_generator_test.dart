@@ -19,8 +19,7 @@ void main() {
   });
 
   test('generates a transparent ESP-IDF blink project', () async {
-    final EspIdfProject project =
-        await const EspIdfProjectGenerator().generate(
+    final EspIdfProject project = await const EspIdfProjectGenerator().generate(
       FirmwareProgram.blink(
         pin: 2,
         period: const Duration(milliseconds: 250),
@@ -35,15 +34,16 @@ void main() {
       '${temporaryDirectory.path}${Platform.pathSeparator}main'
       '${Platform.pathSeparator}main.c',
     ).readAsString();
-    final Map<String, Object?> manifest =
-        (jsonDecode(await File(
+    final Map<String, Object?> manifest = (jsonDecode(await File(
       '${temporaryDirectory.path}${Platform.pathSeparator}flint_program.json',
     ).readAsString()) as Map<Object?, Object?>)
-            .cast<String, Object?>();
+        .cast<String, Object?>();
 
     expect(rootCMake, contains(r'include($ENV{IDF_PATH}'));
     expect(mainC, contains('void app_main(void)'));
     expect(mainC, contains('GPIO_NUM_2'));
+    expect(mainC, contains('\n    ESP_ERROR_CHECK(gpio_reset_pin'));
+    expect(mainC, contains('\n        ESP_ERROR_CHECK(gpio_set_level'));
     expect(mainC, contains('pdMS_TO_TICKS(250)'));
     expect(mainC, contains('does not embed or execute the Dart VM'));
     expect(manifest['runtime'], 'native-esp-idf-c-no-dart-vm');
@@ -64,6 +64,39 @@ void main() {
           name: 'invalid',
           operations: <FirmwareOperation>[
             WriteDigitalOutput(2, DigitalLevel.high),
+          ],
+        ),
+        temporaryDirectory,
+      ),
+      throwsA(isA<HardwareException>()),
+    );
+  });
+
+  test('rejects unreachable and repeated configuration operations', () async {
+    await expectLater(
+      const EspIdfProjectGenerator().generate(
+        const FirmwareProgram(
+          name: 'unreachable',
+          operations: <FirmwareOperation>[
+            ConfigureDigitalOutput(2),
+            RepeatForever(<FirmwareOperation>[
+              WriteDigitalOutput(2, DigitalLevel.high),
+            ]),
+            WriteDigitalOutput(2, DigitalLevel.low),
+          ],
+        ),
+        temporaryDirectory,
+      ),
+      throwsA(isA<HardwareException>()),
+    );
+    await expectLater(
+      const EspIdfProjectGenerator().generate(
+        const FirmwareProgram(
+          name: 'reconfigure',
+          operations: <FirmwareOperation>[
+            RepeatForever(<FirmwareOperation>[
+              ConfigureDigitalOutput(2),
+            ]),
           ],
         ),
         temporaryDirectory,

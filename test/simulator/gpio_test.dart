@@ -48,7 +48,8 @@ void main() {
       await board.close();
     });
 
-    test('enforces pin ownership and permits reacquisition after close', () async {
+    test('enforces pin ownership and permits reacquisition after close',
+        () async {
       final SimulatedBoard board = SimulatedBoard();
       final DigitalOutput first = board.gpio.output(2);
 

@@ -142,11 +142,22 @@ final class EspIdfProjectGenerator {
 
   void _validateOperations(
     List<FirmwareOperation> operations,
-    Set<int> configuredOutputs,
-  ) {
-    for (final FirmwareOperation operation in operations) {
+    Set<int> configuredOutputs, {
+    bool insideLoop = false,
+  }) {
+    for (int index = 0; index < operations.length; index++) {
+      final FirmwareOperation operation = operations[index];
       switch (operation) {
         case ConfigureDigitalOutput(:final int pin):
+          if (insideLoop) {
+            throw HardwareException(
+              code: HardwareErrorCode.generationFailure,
+              message:
+                  'GPIO configuration cannot repeat inside a forever block.',
+              operation: 'validate firmware IR',
+              resource: 'gpio:$pin',
+            );
+          }
           Esp32DevKitProfile.validateDigitalOutput(pin);
           if (!configuredOutputs.add(pin)) {
             throw HardwareException(
@@ -177,23 +188,34 @@ final class EspIdfProjectGenerator {
               operation: 'validate firmware IR',
             );
           }
-        case RepeatForever(:final List<FirmwareOperation> operations):
-          if (operations.isEmpty) {
+        case RepeatForever(operations: final List<FirmwareOperation> body):
+          if (body.isEmpty) {
             throw HardwareException(
               code: HardwareErrorCode.generationFailure,
               message: 'A repeat-forever block cannot be empty.',
               operation: 'validate firmware IR',
             );
           }
-          if (operations
-              .any((FirmwareOperation child) => child is RepeatForever)) {
+          if (body.any((FirmwareOperation child) => child is RepeatForever)) {
             throw HardwareException(
               code: HardwareErrorCode.generationFailure,
               message: 'Nested repeat-forever blocks are not supported.',
               operation: 'validate firmware IR',
             );
           }
-          _validateOperations(operations, configuredOutputs);
+          if (index != operations.length - 1) {
+            throw HardwareException(
+              code: HardwareErrorCode.generationFailure,
+              message: 'Operations after a repeat-forever block are '
+                  'unreachable.',
+              operation: 'validate firmware IR',
+            );
+          }
+          _validateOperations(
+            body,
+            configuredOutputs,
+            insideLoop: true,
+          );
       }
     }
   }
@@ -260,35 +282,32 @@ $body}
             :final DigitalLevel initialLevel,
           ):
           output.writeln(
-              '$spacing ESP_ERROR_CHECK(gpio_reset_pin(GPIO_NUM_$pin));'
-                  .trimLeft());
-          output.writeln(
-            '$spacing ESP_ERROR_CHECK(gpio_set_direction(GPIO_NUM_$pin, GPIO_MODE_OUTPUT));'
-                .trimLeft(),
+            '${spacing}ESP_ERROR_CHECK(gpio_reset_pin(GPIO_NUM_$pin));',
           );
           output.writeln(
-            '$spacing ESP_ERROR_CHECK(gpio_set_level(GPIO_NUM_$pin, '
-                    '${initialLevel.isHigh ? 1 : 0}));'
-                .trimLeft(),
+            '${spacing}ESP_ERROR_CHECK('
+            'gpio_set_direction(GPIO_NUM_$pin, GPIO_MODE_OUTPUT));',
           );
           output.writeln(
-            '$spacing ESP_LOGI(TAG, "configured GPIO $pin as output");'
-                .trimLeft(),
+            '${spacing}ESP_ERROR_CHECK(gpio_set_level(GPIO_NUM_$pin, '
+            '${initialLevel.isHigh ? 1 : 0}));',
+          );
+          output.writeln(
+            '${spacing}ESP_LOGI(TAG, "configured GPIO $pin as output");',
           );
         case WriteDigitalOutput(:final int pin, :final DigitalLevel level):
           output.writeln(
-            '$spacing ESP_ERROR_CHECK(gpio_set_level(GPIO_NUM_$pin, '
-                    '${level.isHigh ? 1 : 0}));'
-                .trimLeft(),
+            '${spacing}ESP_ERROR_CHECK(gpio_set_level(GPIO_NUM_$pin, '
+            '${level.isHigh ? 1 : 0}));',
           );
           output.writeln(
-            '$spacing ESP_LOGI(TAG, "GPIO $pin ${level.name.toUpperCase()}");'
-                .trimLeft(),
+            '${spacing}ESP_LOGI('
+            'TAG, "GPIO $pin ${level.name.toUpperCase()}");',
           );
         case FirmwareDelay(:final Duration duration):
           output.writeln(
-            '$spacing vTaskDelay(pdMS_TO_TICKS(${duration.inMilliseconds}));'
-                .trimLeft(),
+            '${spacing}vTaskDelay('
+            'pdMS_TO_TICKS(${duration.inMilliseconds}));',
           );
         case RepeatForever(:final List<FirmwareOperation> operations):
           output.writeln('${spacing}while (true) {');
@@ -345,9 +364,14 @@ final class EspIdfToolchain {
   Future<EspIdfCommandResult> monitor(
     Directory project, {
     required String port,
-  }) =>
-      _run(<String>['-p', port, 'monitor'],
-          project: project, interactive: true);
+  }) async {
+    await version();
+    return _run(
+      <String>['-p', port, 'monitor'],
+      project: project,
+      interactive: true,
+    );
+  }
 
   Future<EspIdfCommandResult> _run(
     List<String> arguments, {
@@ -378,11 +402,22 @@ final class EspIdfToolchain {
         workingDirectory: project?.path,
         runInShell: Platform.isWindows,
       );
+      final String standardOutput = '${result.stdout}'.trim();
+      final String standardError = '${result.stderr}'.trim();
+      final String diagnostic = '$standardOutput\n$standardError'.toLowerCase();
+      if (result.exitCode != 0 &&
+          (diagnostic.contains('not recognized') ||
+              diagnostic.contains('not found') ||
+              diagnostic.contains('cannot find'))) {
+        throw ToolchainUnavailableException(
+          'Could not execute $executable. Install and activate ESP-IDF first.',
+        );
+      }
       return EspIdfCommandResult(
         command: command,
         exitCode: result.exitCode,
-        standardOutput: '${result.stdout}'.trim(),
-        standardError: '${result.stderr}'.trim(),
+        standardOutput: standardOutput,
+        standardError: standardError,
       );
     } on ProcessException catch (error) {
       throw ToolchainUnavailableException(

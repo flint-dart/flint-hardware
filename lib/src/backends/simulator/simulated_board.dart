@@ -130,6 +130,13 @@ final class SimulatedBoard implements HardwareBoard {
   /// Creates a typed simulated sensor with an explicit initial value.
   SimulatedSensor<T> sensor<T>(String id, T initialValue) {
     _ensureOpen('create sensor');
+    if (id.trim().isEmpty) {
+      throw InvalidHardwareArgumentException(
+        argument: 'id',
+        value: id,
+        message: 'A simulated sensor ID cannot be empty.',
+      );
+    }
     final SimulatedSensor<T> value =
         SimulatedSensor<T>._(this, id, initialValue);
     _register(value);
@@ -632,6 +639,7 @@ final class SimulatedI2cController implements I2cController {
     int address,
     SimulatedI2cResponder responder,
   ) {
+    _board._ensureOpen('register I2C device');
     _ensureBusNumber(busNumber);
     _ensureI2cAddress(address);
     _responders[(busNumber, address)] = responder;
@@ -769,6 +777,7 @@ final class SimulatedSpiController implements SpiController {
     int chipSelect,
     SimulatedSpiResponder responder,
   ) {
+    _board._ensureOpen('register SPI device');
     _ensureBusNumber(busNumber);
     _ensurePin(chipSelect);
     _responders[(busNumber, chipSelect)] = responder;
@@ -1083,6 +1092,7 @@ final class SimulatedAnalogController implements AnalogController {
 
   /// Sets an explicit raw ADC value for a simulated input.
   void setRawValue(int pin, int value, {int resolutionBits = 12}) {
+    _board._ensureOpen('drive analog input');
     _ensurePin(pin);
     if (resolutionBits <= 0 || resolutionBits > 31) {
       throw InvalidHardwareArgumentException(

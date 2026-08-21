@@ -12,12 +12,12 @@ enum HardwareCapability {
 
 /// Immutable identity and capability metadata for a board backend.
 final class BoardDescriptor {
-  const BoardDescriptor({
+  BoardDescriptor({
     required this.id,
     required this.name,
     required this.backend,
-    required this.capabilities,
-  });
+    required Set<HardwareCapability> capabilities,
+  }) : capabilities = Set<HardwareCapability>.unmodifiable(capabilities);
 
   /// A stable identifier within the current process or project.
   final String id;
