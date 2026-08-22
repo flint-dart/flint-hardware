@@ -1,4 +1,4 @@
-## 0.1.0-dev
+## 0.0.1-dev
 
 - Establish the backend-independent board and capability architecture.
 - Add a deterministic hardware simulator and GPIO/PWM foundations.
