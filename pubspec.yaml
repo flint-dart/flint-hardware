@@ -2,8 +2,8 @@ name: flint_hardware
 description: A Dart-first hardware abstraction, simulation, and firmware tooling framework.
 version: 0.1.0-dev
 homepage: https://flintdart.dev
-repository: https://github.com/flint-dart/flint_hardware
-issue_tracker: https://github.com/flint-dart/flint_hardware/issues
+repository: https://github.com/flint-dart/flint-hardware
+issue_tracker: https://github.com/flint-dart/flint-hardware/issues
 
 environment:
   sdk: '>=3.4.0 <4.0.0'
