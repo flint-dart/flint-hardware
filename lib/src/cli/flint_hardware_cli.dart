@@ -1,8 +1,17 @@
 import 'dart:io';
 
 import '../backends/esp32/esp32_firmware.dart';
+import '../backends/pico_sdk/pico_sdk_generator.dart';
+import '../backends/zephyr/zephyr_generator.dart';
 import '../compiler/firmware_program.dart';
+import '../emitters/c_emitter.dart';
+import '../emitters/code_emitter.dart';
+import '../emitters/cpp_emitter.dart';
+import '../emitters/micropython_emitter.dart';
+import '../emitters/ros2_python_emitter.dart';
+import '../emitters/wokwi_bundle_exporter.dart';
 import '../exceptions/hardware_exception.dart';
+import '../targets/target_profile.dart';
 
 typedef CliWrite = void Function(String message);
 
@@ -32,6 +41,10 @@ Future<int> runFlintHardwareCli(
         return _devices(out);
       case 'build':
         return _build(options, toolchain, out, err);
+      case 'export':
+        return _export(options, out, err);
+      case 'simulate':
+        return _simulate(options, out, err);
       case 'flash':
         return _flash(options, toolchain, out, err);
       case 'monitor':
@@ -66,7 +79,7 @@ Future<int> _doctor(
     return result.exitCode;
   } on ToolchainUnavailableException catch (failure) {
     out('ESP-IDF: not available on PATH');
-    out('Status: simulator and --generate-only are available');
+    out('Status: simulator, language exporters, and multi-target --generate-only are available');
     err(failure.message);
     return 69;
   }
@@ -85,53 +98,174 @@ Future<int> _devices(CliWrite out) async {
   return 0;
 }
 
+Future<int> _export(
+  _CliArguments options,
+  CliWrite out,
+  CliWrite err,
+) async {
+  final String targetIdentifier = options.value('target', defaultValue: 'esp32');
+  final BoardTarget boardTarget = BoardTarget.fromIdentifier(targetIdentifier);
+  final String langIdentifier = options.value('lang', defaultValue: 'c');
+  final ExportLanguage lang = ExportLanguage.fromIdentifier(langIdentifier);
+  final int pin = options.integer('pin', defaultValue: 2);
+  final int periodMs = options.integer('period-ms', defaultValue: 500);
+
+  final FirmwareProgram program = FirmwareProgram.blink(
+    pin: pin,
+    period: Duration(milliseconds: periodMs),
+    target: boardTarget,
+  );
+
+  final CodeEmitter emitter = switch (lang) {
+    ExportLanguage.c => const CEmitter(),
+    ExportLanguage.cpp => const CppEmitter(),
+    ExportLanguage.micropython => const MicroPythonEmitter(),
+    ExportLanguage.ros2Python => const Ros2PythonEmitter(),
+  };
+
+  final String code = emitter.emit(program);
+  final String? outputPath = options.valueOrNull('output');
+
+  if (outputPath != null && outputPath.isNotEmpty) {
+    final File outputFile = File(outputPath);
+    await outputFile.parent.create(recursive: true);
+    await outputFile.writeAsString(code);
+    out('Exported ${lang.displayName} to: ${outputFile.path}');
+  } else {
+    out(code);
+  }
+  return 0;
+}
+
+Future<int> _simulate(
+  _CliArguments options,
+  CliWrite out,
+  CliWrite err,
+) async {
+  final String targetIdentifier = options.value('target', defaultValue: 'esp32');
+  final BoardTarget boardTarget = BoardTarget.fromIdentifier(targetIdentifier);
+  final int pin = options.integer('pin', defaultValue: 2);
+  final int periodMs = options.integer('period-ms', defaultValue: 500);
+  final Directory outputDirectory = Directory(
+    options.value(
+      'output',
+      defaultValue: 'build${Platform.pathSeparator}wokwi_simulation',
+    ),
+  ).absolute;
+
+  final FirmwareProgram program = FirmwareProgram.blink(
+    pin: pin,
+    period: Duration(milliseconds: periodMs),
+    target: boardTarget,
+  );
+
+  await const FirmwareBundleExporter().exportToDirectory(program, outputDirectory);
+
+  out('================================================================');
+  out('       FLINT HARDWARE: WOKWI SIMULATION BUNDLE GENERATED        ');
+  out('================================================================');
+  out('Output Directory: ${outputDirectory.path}');
+  out('Files generated:');
+  out('  • diagram.json  (Wokwi Circuit Wiring)');
+  out('  • main.py       (MicroPython Entrypoint)');
+  out('  • sketch.cpp    (Arduino / C++ Entrypoint)');
+  out('  • main.c        (ANSI C99 Entrypoint)');
+  out('  • ros2_node.py  (ROS 2 Python Node)');
+  out('');
+  final String wokwiUrl = switch (boardTarget) {
+    BoardTarget.esp32 || BoardTarget.esp32Cam || BoardTarget.esp32s3 =>
+      'https://wokwi.com/projects/new/micropython-esp32',
+    BoardTarget.rp2040 => 'https://wokwi.com/projects/new/micropython-pi-pico',
+    BoardTarget.stm32f4 => 'https://wokwi.com/projects/new/stm32',
+    BoardTarget.nrf52840 => 'https://wokwi.com/projects/new/esp32',
+  };
+  out('Simulate online:');
+  out('1. Open: $wokwiUrl');
+  out('2. Paste contents of "${outputDirectory.path}${Platform.pathSeparator}main.py"');
+  out('3. Click Play (▶)!');
+  out('================================================================');
+  return 0;
+}
+
 Future<int> _build(
   _CliArguments options,
   EspIdfToolchain toolchain,
   CliWrite out,
   CliWrite err,
 ) async {
-  final String target = options.value('target', defaultValue: 'esp32');
+  final String targetIdentifier = options.value('target', defaultValue: 'esp32');
+  final BoardTarget boardTarget = BoardTarget.fromIdentifier(targetIdentifier);
   final String example = options.value('example', defaultValue: 'blink');
-  if (target != 'esp32') {
-    throw FormatException('Only --target=esp32 is implemented in v0.1.');
-  }
   if (example != 'blink') {
-    throw FormatException('Only --example=blink is implemented in v0.1.');
+    throw FormatException('Only --example=blink is implemented as a built-in CLI template.');
   }
-  final int pin = options.integer('pin', defaultValue: 2);
+
+  final int pin = options.integer('pin', defaultValue: boardTarget == BoardTarget.nrf52840 ? 13 : 2);
   final int periodMilliseconds =
       options.integer('period-ms', defaultValue: 500);
   final Directory outputDirectory = Directory(
     options.value(
       'output',
-      defaultValue: 'build${Platform.pathSeparator}esp32_blink',
+      defaultValue: 'build${Platform.pathSeparator}${boardTarget.identifier}_blink',
     ),
   ).absolute;
+
   final FirmwareProgram program = FirmwareProgram.blink(
     pin: pin,
     period: Duration(milliseconds: periodMilliseconds),
+    target: boardTarget,
   );
-  final EspIdfProject project = await const EspIdfProjectGenerator().generate(
-    program,
-    outputDirectory,
-    overwrite: true,
-  );
-  out('Generated native ESP-IDF project: ${project.directory.path}');
-  out('Dart VM embedded in firmware: no');
-  if (options.flag('generate-only')) {
-    out('Generation complete; ESP-IDF was not invoked.');
-    return 0;
-  }
 
-  final EspIdfCommandResult result =
-      await toolchain.build(project.directory, target: target);
-  _printCommandResult(result, out, err);
-  if (result.succeeded) {
-    out('Application image: ${project.applicationBinary.path}');
-    out('Use the flash command for the complete bootloader/partition/app set.');
+  switch (boardTarget) {
+    case BoardTarget.esp32:
+    case BoardTarget.esp32Cam:
+    case BoardTarget.esp32s3:
+      final EspIdfProject project = await const EspIdfProjectGenerator().generate(
+        program,
+        outputDirectory,
+        overwrite: true,
+      );
+      out('Generated native ESP-IDF project: ${project.directory.path}');
+      out('Target: ${boardTarget.displayName}');
+      out('Dart VM embedded in firmware: no');
+      if (options.flag('generate-only')) {
+        out('Generation complete; ESP-IDF was not invoked.');
+        return 0;
+      }
+      final EspIdfCommandResult result =
+          await toolchain.build(project.directory, target: boardTarget.identifier);
+      _printCommandResult(result, out, err);
+      if (result.succeeded) {
+        out('Application image: ${project.applicationBinary.path}');
+        out('Use the flash command for the complete bootloader/partition/app set.');
+      }
+      return result.exitCode;
+
+    case BoardTarget.rp2040:
+      final PicoSdkProject project = await const PicoSdkProjectGenerator().generate(
+        program,
+        outputDirectory,
+        overwrite: true,
+      );
+      out('Generated native Pico SDK project: ${project.directory.path}');
+      out('Target: ${boardTarget.displayName}');
+      out('Dart VM embedded in firmware: no');
+      out('Build with: cd ${project.directory.path} && mkdir build && cd build && cmake .. && make');
+      return 0;
+
+    case BoardTarget.stm32f4:
+    case BoardTarget.nrf52840:
+      final ZephyrProject project = await const ZephyrProjectGenerator().generate(
+        program,
+        outputDirectory,
+        overwrite: true,
+      );
+      out('Generated native Zephyr RTOS project: ${project.directory.path}');
+      out('Target: ${boardTarget.displayName}');
+      out('Dart VM embedded in firmware: no');
+      out('Build with: west build -b ${boardTarget.identifier} ${project.directory.path}');
+      return 0;
   }
-  return result.exitCode;
 }
 
 Future<int> _flash(
@@ -250,6 +384,8 @@ final class _CliArguments {
   String value(String name, {required String defaultValue}) =>
       _values[name] ?? defaultValue;
 
+  String? valueOrNull(String name) => _values[name];
+
   String requiredValue(String name) {
     final String? value = _values[name];
     if (value == null || value.isEmpty) {
@@ -277,12 +413,25 @@ Flint Hardware 0.1.0-dev
 Usage:
   flint_hardware doctor
   flint_hardware devices
-  flint_hardware build [--target=esp32] [--example=blink] [--pin=2]
-                       [--period-ms=500] [--output=build/esp32_blink]
-                       [--generate-only]
-  flint_hardware flash --project=build/esp32_blink --port=COM7
+  flint_hardware export [--lang=c|cpp|micropython|python-ros2] [--target=esp32|rp2040|...]
+                        [--pin=2] [--period-ms=500] [--output=exported_file]
+  flint_hardware simulate [--target=esp32|rp2040|stm32f4|nrf52840] [--pin=2] [--period-ms=500]
+  flint_hardware build  [--target=esp32|esp32_cam|rp2040|stm32f4|nrf52840]
+                        [--example=blink] [--pin=2] [--period-ms=500]
+                        [--output=build/firmware] [--generate-only]
+  flint_hardware flash   --project=build/esp32_blink --port=COM7
   flint_hardware monitor --project=build/esp32_blink --port=COM7
 
-`build` generates native ESP-IDF C. It does not compile general Dart source or
-embed the Dart VM in ESP32 firmware.
+Supported targets:
+  esp32       Espressif ESP32 DevKit (ESP-IDF)
+  esp32_cam   AI-Thinker ESP32-CAM (ESP-IDF + Camera)
+  rp2040      Raspberry Pi Pico (Pico SDK)
+  stm32f4     STMicroelectronics STM32F4 Discovery (Zephyr RTOS)
+  nrf52840    Nordic Semiconductor nRF52840 DK (Zephyr RTOS)
+
+Supported export languages:
+  c           Pure ANSI C (C99/C11)
+  cpp         Modern C++ / Arduino / PlatformIO
+  micropython MicroPython / CircuitPython
+  python-ros2 ROS 2 Python Robotics Node
 ''';

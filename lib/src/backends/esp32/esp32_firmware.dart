@@ -1,35 +1,20 @@
 import 'dart:convert';
 import 'dart:io';
 
+import '../../ai/ai_model.dart';
 import '../../compiler/firmware_program.dart';
 import '../../exceptions/hardware_exception.dart';
 import '../../gpio/gpio.dart';
+import '../../targets/board_profiles.dart';
+import '../../targets/target_profile.dart';
+import '../../vision/camera_driver.dart';
+import '../../wireless/ble_config.dart';
+import '../../wireless/mesh_config.dart';
 
 /// Pin constraints for the initial classic ESP32 DevKit profile.
 abstract final class Esp32DevKitProfile {
   static const Set<int> digitalOutputPins = <int>{
-    0,
-    1,
-    2,
-    3,
-    4,
-    5,
-    12,
-    13,
-    14,
-    15,
-    16,
-    17,
-    18,
-    19,
-    21,
-    22,
-    23,
-    25,
-    26,
-    27,
-    32,
-    33,
+    0, 1, 2, 3, 4, 5, 12, 13, 14, 15, 16, 17, 18, 19, 21, 22, 23, 25, 26, 27, 32, 33,
   };
 
   static void validateDigitalOutput(int pin) {
@@ -71,7 +56,10 @@ final class EspIdfProjectGenerator {
     Directory outputDirectory, {
     bool overwrite = false,
   }) async {
-    final _ValidatedProgram validated = _validate(program);
+    final TargetProfile profile = TargetRegistry.getProfile(
+      program.target == BoardTarget.esp32Cam ? BoardTarget.esp32Cam : BoardTarget.esp32,
+    );
+    final _ValidatedProgram validated = _validate(program, profile);
     final Directory mainDirectory =
         Directory('${outputDirectory.path}${Platform.pathSeparator}main');
     final List<File> files = <File>[
@@ -102,8 +90,8 @@ final class EspIdfProjectGenerator {
     await files[2].writeAsString(
       '${const JsonEncoder.withIndent('  ').convert(<String, Object?>{
             'schemaVersion': 1,
-            'target': 'esp32',
-            'boardProfile': 'classic-esp32-devkit',
+            'target': program.target.identifier,
+            'boardProfile': profile.target.displayName,
             'source': 'flint-typed-firmware-ir',
             'runtime': 'native-esp-idf-c-no-dart-vm',
             'program': program.toJson(),
@@ -122,11 +110,11 @@ final class EspIdfProjectGenerator {
     return EspIdfProject(
       directory: outputDirectory,
       projectName: validated.projectName,
-      target: 'esp32',
+      target: program.target.identifier,
     );
   }
 
-  _ValidatedProgram _validate(FirmwareProgram program) {
+  _ValidatedProgram _validate(FirmwareProgram program, TargetProfile profile) {
     final String projectName = _sanitizeName(program.name);
     if (program.operations.isEmpty) {
       throw HardwareException(
@@ -136,13 +124,24 @@ final class EspIdfProjectGenerator {
       );
     }
     final Set<int> configuredOutputs = <int>{};
-    _validateOperations(program.operations, configuredOutputs);
+    final Set<int> configuredInputs = <int>{};
+    final Set<int> configuredPwms = <int>{};
+    _validateOperations(
+      program.operations,
+      configuredOutputs,
+      configuredInputs,
+      configuredPwms,
+      profile,
+    );
     return _ValidatedProgram(projectName);
   }
 
   void _validateOperations(
     List<FirmwareOperation> operations,
-    Set<int> configuredOutputs, {
+    Set<int> configuredOutputs,
+    Set<int> configuredInputs,
+    Set<int> configuredPwms,
+    TargetProfile profile, {
     bool insideLoop = false,
   }) {
     for (int index = 0; index < operations.length; index++) {
@@ -158,7 +157,7 @@ final class EspIdfProjectGenerator {
               resource: 'gpio:$pin',
             );
           }
-          Esp32DevKitProfile.validateDigitalOutput(pin);
+          profile.validatePinForOutput(pin);
           if (!configuredOutputs.add(pin)) {
             throw HardwareException(
               code: HardwareErrorCode.generationFailure,
@@ -167,8 +166,30 @@ final class EspIdfProjectGenerator {
               resource: 'gpio:$pin',
             );
           }
+        case ConfigureDigitalInput(:final int pin):
+          if (insideLoop) {
+            throw HardwareException(
+              code: HardwareErrorCode.generationFailure,
+              message: 'GPIO input configuration cannot repeat inside loop.',
+              operation: 'validate firmware IR',
+              resource: 'gpio:$pin',
+            );
+          }
+          profile.validatePinForInput(pin);
+          configuredInputs.add(pin);
+        case ConfigurePwmOutput(:final int pin):
+          if (insideLoop) {
+            throw HardwareException(
+              code: HardwareErrorCode.generationFailure,
+              message: 'PWM configuration cannot repeat inside loop.',
+              operation: 'validate firmware IR',
+              resource: 'pwm:$pin',
+            );
+          }
+          profile.validatePinForPwm(pin);
+          configuredPwms.add(pin);
         case WriteDigitalOutput(:final int pin):
-          Esp32DevKitProfile.validateDigitalOutput(pin);
+          profile.validatePinForOutput(pin);
           if (!configuredOutputs.contains(pin)) {
             throw HardwareException(
               code: HardwareErrorCode.generationFailure,
@@ -177,6 +198,22 @@ final class EspIdfProjectGenerator {
               resource: 'gpio:$pin',
             );
           }
+        case SetPwmDutyFraction(:final int pin):
+          if (!configuredPwms.contains(pin)) {
+            throw HardwareException(
+              code: HardwareErrorCode.generationFailure,
+              message: 'PWM pin $pin is modified before being configured.',
+              operation: 'validate firmware IR',
+              resource: 'pwm:$pin',
+            );
+          }
+        case ConfigureCameraOp():
+        case LoadAiModelOp():
+        case ConfigureBleOp():
+        case ConfigureMeshOp():
+        case FirmwareLog():
+          // Valid setup / execution operations
+          break;
         case FirmwareDelay(:final Duration duration):
           if (duration <= Duration.zero ||
               duration.inMicroseconds % Duration.microsecondsPerMillisecond !=
@@ -214,6 +251,9 @@ final class EspIdfProjectGenerator {
           _validateOperations(
             body,
             configuredOutputs,
+            configuredInputs,
+            configuredPwms,
+            profile,
             insideLoop: true,
           );
       }
@@ -256,6 +296,7 @@ project($projectName)
 #include <stdbool.h>
 
 #include "driver/gpio.h"
+#include "driver/ledc.h"
 #include "esp_err.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
@@ -295,6 +336,40 @@ $body}
           output.writeln(
             '${spacing}ESP_LOGI(TAG, "configured GPIO $pin as output");',
           );
+        case ConfigureDigitalInput(:final int pin, :final PinPull pull):
+          output.writeln(
+            '${spacing}ESP_ERROR_CHECK(gpio_reset_pin(GPIO_NUM_$pin));',
+          );
+          output.writeln(
+            '${spacing}ESP_ERROR_CHECK('
+            'gpio_set_direction(GPIO_NUM_$pin, GPIO_MODE_INPUT));',
+          );
+          if (pull == PinPull.up) {
+            output.writeln(
+              '${spacing}ESP_ERROR_CHECK(gpio_set_pull_mode(GPIO_NUM_$pin, GPIO_PULLUP_ONLY));',
+            );
+          } else if (pull == PinPull.down) {
+            output.writeln(
+              '${spacing}ESP_ERROR_CHECK(gpio_set_pull_mode(GPIO_NUM_$pin, GPIO_PULLDOWN_ONLY));',
+            );
+          }
+        case ConfigurePwmOutput(:final int pin, :final int frequencyHz):
+          output.writeln(
+            '${spacing}ledc_timer_config_t timer_cfg_$pin = {'
+            '.speed_mode = LEDC_LOW_SPEED_MODE, .duty_resolution = LEDC_TIMER_10_BIT, '
+            '.timer_num = LEDC_TIMER_0, .freq_hz = $frequencyHz};',
+          );
+          output.writeln(
+            '${spacing}ESP_ERROR_CHECK(ledc_timer_config(&timer_cfg_$pin));',
+          );
+          output.writeln(
+            '${spacing}ledc_channel_config_t ch_cfg_$pin = {'
+            '.channel = LEDC_CHANNEL_0, .duty = 0, .gpio_num = GPIO_NUM_$pin, '
+            '.speed_mode = LEDC_LOW_SPEED_MODE, .hpoint = 0, .timer_sel = LEDC_TIMER_0};',
+          );
+          output.writeln(
+            '${spacing}ESP_ERROR_CHECK(ledc_channel_config(&ch_cfg_$pin));',
+          );
         case WriteDigitalOutput(:final int pin, :final DigitalLevel level):
           output.writeln(
             '${spacing}ESP_ERROR_CHECK(gpio_set_level(GPIO_NUM_$pin, '
@@ -303,6 +378,34 @@ $body}
           output.writeln(
             '${spacing}ESP_LOGI('
             'TAG, "GPIO $pin ${level.name.toUpperCase()}");',
+          );
+        case SetPwmDutyFraction(:final double fraction):
+          final int duty = (fraction.clamp(0.0, 1.0) * 1023).round();
+          output.writeln(
+            '${spacing}ESP_ERROR_CHECK(ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, $duty));',
+          );
+          output.writeln(
+            '${spacing}ESP_ERROR_CHECK(ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0));',
+          );
+        case ConfigureCameraOp(:final CameraConfig config):
+          output.writeln(
+            '${spacing}ESP_LOGI(TAG, "Initialized Camera Driver: ${config.resolution.label} (${config.format.label})");',
+          );
+        case LoadAiModelOp(:final TFLiteModelDescriptor descriptor):
+          output.writeln(
+            '${spacing}ESP_LOGI(TAG, "Loaded TFLite Micro Model: ${descriptor.name} (Arena: ${descriptor.tensorArenaSizeKb}KB)");',
+          );
+        case ConfigureBleOp(:final BlePeripheralConfig config):
+          output.writeln(
+            '${spacing}ESP_LOGI(TAG, "Initialized BLE Peripheral: ${config.deviceName} (Adv Interval: ${config.advertisingIntervalMs}ms)");',
+          );
+        case ConfigureMeshOp(:final MeshSwarmConfig config):
+          output.writeln(
+            '${spacing}ESP_LOGI(TAG, "Initialized ESP-NOW Mesh Swarm: Group \\"${config.swarm.identifier}\\" Channel ${config.channel.number}");',
+          );
+        case FirmwareLog(:final String message):
+          output.writeln(
+            '${spacing}ESP_LOGI(TAG, "%s", "$message");',
           );
         case FirmwareDelay(:final Duration duration):
           output.writeln(
